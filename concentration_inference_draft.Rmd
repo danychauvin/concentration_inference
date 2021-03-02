@@ -1,0 +1,996 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Loading packages
+
+```{r}
+    library(tidyverse)
+    library(RcppArmadillo)
+    library(tools)
+    library(here)
+    library(cowplot)
+    library(devtools)
+    library(multidplyr)
+    library(vngMoM)
+    library(ggCustomTJ)
+    library(renv)
+    library(svglite)
+    Sys.setenv(RETICULATE_PYTHON = '/scicore/home/nimwegen/rocasu25/.local/share/r-miniconda/envs/r-reticulate/bin/python')
+    library(reticulate)
+    library(ggcorrplot)
+    library(lemon)
+    library(parallel)
+    library(broom)
+    library(stats)
+    library(ggpubr)
+```
+
+# Generating in silico data
+
+Let's assume we work with one promoter, in one condition. We perform one experiment.
+The underlying process is simply biomass which grows exponentially within the well.
+We'll imagine the cells are growing in M9 glucose. We should be measuring a doubling rate of ~ 1h.
+We begin by picking a growth-rate around this mean value.
+
+
+Let's note x, the doublings per hour, and set a relevant distribution for this particular well.
+```{r}
+mean_x <- 1
+std_x <- 0.05 #which corresponds to 5% CV
+xmin <- 0
+xmax <- 2
+xstep <- 0.01
+x <- seq(xmin, xmax, xstep)
+plot(x, dnorm(x, mean_x, std_x), type = "l",
+  xlab="Doublings per hour (h-1)",
+  ylab="Density")
+```
+Now let's pick a growth-rate in this distribution. And generate a vector of growth. gr is now the exponential growth rate, such that log(od)=od_ini*exp(gr.t). gr is in min-1. I also set the maximum OD to 0.1. Which should be reached after: (log(0.1)-log(0.01))/gr ~ 200 min. We assume correction is perfect, and that OD=0 when there is no biomass.
+
+```{r}
+gr <- rnorm(1,mean_x,std_x)*log(2)/60
+# Setting initial od, and growth boundaries
+lod_ini <- log(0.03)
+time_min <- seq(from = 0, to = 200, by = 30)
+lod <- lod_ini+ gr*time_min
+
+plot(time_min, lod, type = "p",
+  xlab="Time in hour",
+  ylab="Corrected OD")
+
+plot(time_min, exp(lod), type = "p",
+  xlab="Time in hour",
+  ylab="Corrected OD")
+```
+
+Now we'll add some noise on top of this. I set the noise so that residuals are randomly taken from a gaussian distribution. I set the noise to a fix size: which is on the order of 0.01.
+
+```{r}
+residuals <- rnorm(length(lod),0,0.01)
+od_noisy <- exp(lod)+residuals
+lod_noisy <- log(od_noisy)
+
+plot(time_min, lod_noisy, type = "p",
+  xlab="Time in hour",
+  ylab="Corrected OD")
+
+plot(time_min, exp(lod_noisy), type = "p",
+  xlab="Time in hour",
+  ylab="Corrected OD")
+```
+Now it is time to generate some GFP, starting from the assumption that:
+f=od*alpha+beta+noise. alpha = alpha_p + alpha_0.
+I have to pick a certain alpha, and a certain alpha_p.
+beta is set to ~50 FU (fluorescence unit).
+alpha_0 is set to lead to ~100 FU. So set it to 1000 (picked again from random distribution).
+
+
+```{r}
+mean_alpha_0 <- 1000
+std_alpha_0 <- 0.01*mean_alpha_0
+min_alpha_p <- 1000
+max_alpha_p <- 50000
+alpha_p <- runif(1,min_alpha_p,max_alpha_p)
+mean_beta <- 50
+std_beta <- 5
+
+#Pick mean_alpha_o, p and beta.
+alpha_0 <- rnorm(1,mean_alpha_0,std_alpha_0)
+beta <- rnorm(1,mean_beta,std_beta)
+
+# Set the fluo
+f <- exp(lod)*(alpha_0+alpha_p)+beta
+
+# Randomly pick some noise for the fluorescence
+f_noise <- rnorm(length(f),0,sqrt(mean(f)))
+f_noisy <- f+f_noise
+
+plot(time_min, f_noisy, type = "p",
+  xlab="Time in hour",
+  ylab="Fluorescent")
+
+plot(time_min, od_noisy, type = "p",
+  xlab="Time in hour",
+  ylab="Corrected OD")
+```
+
+Now the code seems to be complete. Everything seems to work fine, need to put everything into a function that be called and return a nice dataset.
+
+# Generate in silico dataset
+
+Let's generate a set of 99 promoters + 1 control promoter (no fluorescence).
+The first is the control one.
+We consider a single condition now, analog to glucose.
+The promoters are caracterized by an alpha_0 that's the fame for all.
+
+```{r}
+N_promoter <- 99
+N_control <- 1
+replicates <- 3
+
+mean_alpha_0 <- 1000
+std_alpha_0 <- 0.01*mean_alpha_0
+mean_beta <- 50
+std_beta <- 5
+alpha_0 <- rnorm(1,mean_alpha_0,std_alpha_0)
+beta <- rnorm(1,mean_beta,std_beta)
+min_alpha_p <- 1000
+max_alpha_p <- 50000
+mean_x <- 1
+std_x <- 0.05
+lod_ini <- log(0.03)
+time_min <- seq(from = 0, to = 200, by = 30)
+
+generate_traces <- function(control,rep){
+  
+  if(control==TRUE){
+  alpha_p <- 0
+  }else{
+  alpha_p <- runif(1,min_alpha_p,max_alpha_p)}
+  
+  generate_single_trace <- function(r){
+      gr <- rnorm(1,mean_x,std_x)*log(2)/60
+      lod <- lod_ini+ gr*time_min
+      residuals <- rnorm(length(lod),0,0.01)
+      od_noisy <- exp(lod)+residuals
+      lod_noisy <- log(od_noisy)
+      f <- exp(lod)*(alpha_0+alpha_p)+beta
+      f_noise <- rnorm(length(f),0,sqrt(mean(f)))
+      f_noisy <- f+f_noise
+      new_df <- tibble(time_min=time_min,corrected_od=od_noisy,fluo=f_noisy,replicate=r,alpha_p=alpha_p,alpha_0=alpha_0,beta=beta)
+      return(new_df)}
+  
+  .final_df <- lapply(c(1:rep), generate_single_trace)
+  .final_df <- do.call(rbind,.final_df)
+  return(.final_df)
+}
+```
+
+Now use generate_trace to generate multiple in silico data at the same time
+```{r}
+mydata_silico <- tibble(promoter=c(1:100)) %>% 
+  group_by(promoter) %>% 
+  #partition(cluster=mycluster) %>%
+  do((function(.df){
+    .promoter <- unique(.df$promoter)
+    if(.promoter==1){
+      .control <- TRUE
+    }else{
+      .control <- FALSE}
+    new_df <- generate_traces(.control,replicates) %>% 
+      mutate(promoter=.promoter,
+             control=.control)
+    return(new_df)})(.)) %>% 
+  #collect() %>% 
+  ungroup()
+```
+
+Now checking results
+```{r}
+mydata_silico %>% 
+  filter(promoter %in% c(1:5)) %>% 
+  ggplot() +
+  geom_point(aes(time_min,corrected_od))+
+  facet_wrap(~interaction(promoter,replicate),scales="free")+
+  theme_cowplot()
+
+mydata_silico %>% 
+  filter(promoter %in% c(1:5)) %>% 
+  ggplot() +
+  geom_point(aes(time_min,fluo))+
+  facet_wrap(~interaction(promoter,replicate),scales="free")+
+  theme_cowplot()
+```
+# Everything looks fine and can be used as correct in silico data
+
+Next step: implement Erik's inference on these data.
+
+## Inference
+
+First: computing optimal value for Beta.
+
+```{r}
+mydata_inference <- mydata_silico %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_xy_p=mean(corrected_od*fluo)) %>% 
+  mutate(mean_x2_p=mean((corrected_od)**2)) %>% 
+  mutate(mean_x_p=mean(corrected_od)) %>% 
+  ungroup() %>% 
+  mutate(aip=fluo-corrected_od*mean_xy_p/mean_x2_p) %>% 
+  mutate(bip=1-corrected_od*mean_x_p/mean_x2_p) %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_apbp=mean(aip*bip),
+         mean_ap2=mean(aip**2),
+         mean_bp2=mean(bip**2)) %>% 
+  mutate(Np=n()) %>% 
+  ungroup() %>% 
+  distinct(promoter,replicate,.keep_all=TRUE)
+```
+
+Now mydata_inference is ready for Beta optimization by dichotomic search.
+
+```{r}
+compute_dL_dB <- function(.beta){
+  compute_dL_dB_p <- function(map2,mbp2,mapbp,np,.beta){
+    val_p <- np*(mapbp-mbp2*.beta)/(map2+mbp2*.beta**2-2*.beta*mapbp)}
+    
+  new_df <- mydata_inference %>% 
+    mutate(dL_dB_p=compute_dL_dB_p(mean_ap2,mean_bp2,mean_apbp,Np,.beta))
+    dL_dB <- sum(new_df$dL_dB_p)
+  return(dL_dB)
+}
+
+dichotomic_search <- function(.beta_max_ini){
+  beta <- 0
+  dL_dB <- compute_dL_dB(beta)
+  if(dL_dB<=0){
+    print(sprintf("beta,dL_dB = %s,%s",as.character(beta),as.character(dL_dB)))
+    return(0)
+  }else if(dL_dB>=0){
+    beta_min <- 0
+    beta_max <- .beta_max_ini}
+  
+  dL_dB <- compute_dL_dB(beta_max)
+  
+  while(dL_dB>0){
+  beta_max <- beta_max*2
+  dL_dB <- compute_dL_dB(beta_max)
+  }
+  print("Negative dL_dB, beginning dichotomic search")
+  print(sprintf("With beta_max,dL_dB = %s,%s",as.character(beta_max),as.character(dL_dB)))
+  
+  while((2*abs(beta_min-beta_max)/(beta_max+beta_min))>1e-3){
+    print(sprintf("beta_max,beta_min = %s,%s",as.character(beta_max),as.character(beta_min)))
+    beta <- (beta_max+beta_min)/2
+    dL_dB <- compute_dL_dB(beta)
+    print(sprintf("beta,dL_dB = %s,%s",as.character(beta),as.character(dL_dB)))
+    if(dL_dB>=0){
+      beta_min <- beta
+    }else{
+      beta_max <- beta}}
+}
+
+dichotomic_search(500)
+```
+
+
+```{r}
+mydata_silico %>%
+  group_by(promoter,replicate) %>%
+  mutate(intercept=linear_mod_intercept(fluo,corrected_od)) %>% 
+  ungroup() %>% 
+  distinct(promoter,replicate,.keep_all=TRUE) %>% 
+  .$intercept %>% 
+  mean
+
+# That could be used as a start estimation for
+```
+
+# Other method: estimating beta by marginalizing over the ap
+
+## Optimizing Betas
+
+First we need to compute Bp and Qp2
+
+```{r}
+mydata_inference <- mydata_silico %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_xy_p=mean(corrected_od*fluo)) %>% 
+  mutate(mean_x2_p=mean((corrected_od)**2)) %>% 
+  mutate(mean_y2_p=mean((fluo)**2)) %>% 
+  mutate(mean_x_p=mean(corrected_od)) %>%
+  mutate(mean_y_p=mean(fluo)) %>%
+  mutate(var_x_p=var(corrected_od)) %>% 
+  mutate(Bp=(mean_y_p*mean_x2_p-mean_xy_p*mean_x_p)/(var_x_p)) %>% 
+  mutate(Qp2=(mean_y2_p*mean_x2_p-mean_xy_p**2)/(var_x_p)-Bp**2) %>% 
+  mutate(Np=n()) %>% 
+  ungroup() %>%
+  distinct(promoter,replicate,.keep_all=TRUE)
+```
+
+
+```{r}
+compute_wp <- function(.Bp,.Qp2,np,.beta){
+  wp_val <- (np-1)/((.beta-.Bp)**2 + .Qp2)
+  return(wp_val)}
+
+compute_beta <- function(.df){
+  .new_df <- .df %>% 
+    mutate(num=wp*Bp)
+  val <- (sum(.new_df$num))/(sum(.df$wp))
+  return(val)}
+
+iterative_search <- function(.beta_ini){
+  
+  .old_beta <- .beta_ini
+  
+  .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+  
+  .new_beta <- compute_beta(.df)
+  
+  while(abs(.new_beta-.old_beta)>0.01){
+    print(sprintf("old_beta,new_beta=%s,%s",as.character(.old_beta),as.character(.new_beta)))
+    .old_beta <- .new_beta
+    .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+    .new_beta <- compute_beta(.df)}
+    
+    return(.new_beta)
+
+  }
+
+opt_beta <- iterative_search(500)
+```
+
+## Optimizing ap
+
+```{r}
+mydata_inference <- mydata_inference %>% 
+  mutate(beta_predict=opt_beta) %>% 
+  mutate(alpha_p_predict=(mean_xy_p-beta_predict*mean_x_p)/(mean_x2_p)) %>% 
+  mutate(var_alpha_p=((beta_predict-Bp)**2+Qp2)/Np) %>% 
+  mutate(sd_alpha_p=(sqrt(var_alpha_p)))
+
+mydata_inference %>% 
+  ggplot()+
+  geom_point(aes(alpha_p,alpha_p_predict))+
+  geom_errorbar(aes(x=alpha_p,ymin=alpha_p_predict-sd_alpha_p,ymax=alpha_p_predict+sd_alpha_p))+
+  geom_abline(aes(slope=1,intercept=0))
+```
+There is a slight offset for small values, which might be due overestimation of Beta?
+Or from the fact that the noise in f is a sqrt of f. (Poissonian noise). Let's wrap up the code for more efficiency.
+
+# Cleaner code
+
+# Generate in silico dataset
+
+Let's generate a set of 99 promoters + 1 control promoter (no fluorescence).
+The first is the control one.
+We consider a single condition now, analog to glucose.
+The promoters are caracterized by an alpha_0 that's the fame for all.
+
+```{r}
+N_promoter <- 99
+N_control <- 1
+replicates <- 3
+
+mean_alpha_0 <- 1000
+std_alpha_0 <- 0.01*mean_alpha_0
+mean_beta <- 200
+std_beta <- sqrt(mean_beta)
+#std_beta <- 0
+alpha_0 <- rnorm(1,mean_alpha_0,std_alpha_0)
+beta <- rnorm(1,mean_beta,std_beta)
+min_alpha_p <- 1000
+max_alpha_p <- 50000
+mean_x <- 1
+std_x <- 0.05
+lod_ini <- log(0.03)
+time_min <- seq(from = 0, to = 200, by = 30)
+exp_err_od <- 0.01
+
+generate_traces <- function(control,rep){
+  
+  if(control==TRUE){
+  alpha_p <- 0
+  }else{
+  alpha_p <- runif(1,min_alpha_p,max_alpha_p)}
+  
+  generate_single_trace <- function(r){
+      gr <- rnorm(1,mean_x,std_x)*log(2)/60
+      lod <- lod_ini + gr*time_min
+      residuals <- rnorm(length(lod),0,exp_err_od)
+      #residuals <- rnorm(length(lod),0,0)
+      od_noisy <- exp(lod)+residuals
+      lod_noisy <- log(od_noisy)
+      f <- exp(lod)*(alpha_0+alpha_p)+beta
+      #f_noise <- rnorm(length(f),0,0)
+      f_noise <- rnorm(length(f),0,sqrt(mean(f)))
+      #f_noise <- rnorm(length(f),0,100)
+      f_noisy <- f+f_noise
+      new_df <- tibble(time_min=time_min,corrected_od=od_noisy,fluo=f_noisy,replicate=r,alpha_p=alpha_p,alpha_0=alpha_0,beta=beta)
+      return(new_df)}
+  
+  .final_df <- lapply(c(1:rep), generate_single_trace)
+  .final_df <- do.call(rbind,.final_df)
+  return(.final_df)
+}
+
+mydata_silico <- tibble(promoter=c(1:100)) %>% 
+  group_by(promoter) %>% 
+  #partition(cluster=mycluster) %>%
+  do((function(.df){
+    .promoter <- unique(.df$promoter)
+    if(.promoter==1){
+      .control <- TRUE
+    }else{
+      .control <- FALSE}
+    new_df <- generate_traces(.control,replicates) %>% 
+      mutate(promoter=.promoter,
+             control=.control)
+    return(new_df)})(.)) %>% 
+  #collect() %>% 
+  ungroup()
+
+mydata_inference <- mydata_silico %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_xy_p=mean(corrected_od*fluo)) %>% 
+  mutate(mean_x2_p=mean((corrected_od)**2)) %>% 
+  mutate(mean_y2_p=mean((fluo)**2)) %>% 
+  mutate(mean_x_p=mean(corrected_od)) %>%
+  mutate(mean_y_p=mean(fluo)) %>%
+  mutate(var_x_p=var(corrected_od)) %>% 
+  mutate(Bp=(mean_y_p*mean_x2_p-mean_xy_p*mean_x_p)/(var_x_p)) %>% 
+  mutate(Qp2=(mean_y2_p*mean_x2_p-mean_xy_p**2)/(var_x_p)-Bp**2) %>% 
+  mutate(Np=n()) %>% 
+  ungroup() %>%
+  distinct(promoter,replicate,.keep_all=TRUE)
+
+compute_wp <- function(.Bp,.Qp2,np,.beta){
+  wp_val <- (np-1)/((.beta-.Bp)**2 + .Qp2)
+  return(wp_val)}
+
+compute_beta <- function(.df){
+  .new_df <- .df %>% 
+    mutate(num=wp*Bp)
+  val <- (sum(.new_df$num))/(sum(.new_df$wp))
+  return(val)}
+
+compute_error_beta <- function(.beta){
+  .new_df <- mydata_inference %>% 
+    mutate(dL2_dB2=(Np-1)*(Qp2-(.beta-Bp)**2)/(Qp2+(.beta-Bp)**2)**2)
+  val <- 1/sum(.new_df$dL2_dB2)
+  return(val)}
+
+iterative_search <- function(.beta_ini){
+  
+  .old_beta <- .beta_ini
+  
+  .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+  
+  .new_beta <- compute_beta(.df)
+  
+  while(abs(.new_beta-.old_beta)>0.01){
+    print(sprintf("old_beta,new_beta=%s,%s",as.character(.old_beta),as.character(.new_beta)))
+    .old_beta <- .new_beta
+    .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+    .new_beta <- compute_beta(.df)}
+    
+    return(.new_beta)
+
+  }
+
+approx_beta <- mydata_silico %>%
+  group_by(promoter,replicate) %>%
+  mutate(intercept=linear_mod_intercept(fluo,corrected_od)) %>% 
+  ungroup() %>% 
+  distinct(promoter,replicate,.keep_all=TRUE) %>% 
+  .$intercept %>% 
+  mean
+
+opt_beta <- iterative_search(approx_beta)
+err_beta <- compute_error_beta(opt_beta)
+
+#Setting some error bars on beta
+
+mydata_inference <- mydata_inference %>% 
+  mutate(beta_predict=opt_beta) %>% 
+  mutate(beta_var=err_beta) %>% 
+  mutate(beta_sd=sqrt(beta_var)) %>% 
+  mutate(alpha_p_predict=(mean_xy_p-beta_predict*mean_x_p)/(mean_x2_p)) %>% 
+  mutate(var_alpha_p=var_x_p/(mean_x2_p**2)*((beta_predict-Bp)**2+Qp2)/Np) %>% 
+  mutate(sd_alpha_p=(sqrt(var_alpha_p)))
+
+mydata_inference %>% 
+  ggplot()+
+  geom_point(aes(alpha_p+alpha_0,alpha_p_predict))+
+  geom_errorbar(aes(x=alpha_p+alpha_0,ymin=alpha_p_predict-sd_alpha_p,ymax=alpha_p_predict+sd_alpha_p))+
+  geom_abline(aes(slope=1,intercept=0))
+
+mydata_inference %>% 
+  select(beta,beta_predict,beta_sd) %>% 
+  filter(row_number()==1)
+```
+
+# Generate in silico dataset and perform the inference
+
+## All replicates considered
+
+Let's generate a set of 99 promoters + 1 control promoter (no fluorescence).
+The first is the control one.
+We consider a single condition now, analog to glucose.
+The promoters are characterized by an alpha_0 that's the fame for all.
+
+```{r}
+N_promoter <- 99
+N_control <- 1
+replicates <- 3
+
+mean_alpha_0 <- 1000
+std_alpha_0 <- 0.01*mean_alpha_0
+mean_beta <- 200
+std_beta <- sqrt(mean_beta)
+#std_beta <- 0
+alpha_0 <- rnorm(1,mean_alpha_0,std_alpha_0)
+beta <- rnorm(1,mean_beta,std_beta)
+min_alpha_p <- 1000
+max_alpha_p <- 50000
+mean_x <- 1
+std_x <- 0.05
+lod_ini <- log(0.03)
+time_min <- seq(from = 0, to = 200, by = 15)
+#exp_err_od <- 0.001
+exp_err_od <- 0.02
+exp_err_f <- 0.02
+
+generate_traces <- function(control,rep){
+  
+  if(control==TRUE){
+  alpha_p <- 0
+  }else{
+  alpha_p <- runif(1,min_alpha_p,max_alpha_p)}
+  
+  generate_single_trace <- function(r){
+      gr <- rnorm(1,mean_x,std_x)*log(2)/60
+      lod <- lod_ini + gr*time_min
+      residuals <- rnorm(length(lod),0,exp_err_od)
+      #residuals <- rnorm(length(lod),0,0)
+      od_noisy <- exp(lod)+residuals
+      lod_noisy <- log(od_noisy)
+      f <- exp(lod)*(alpha_0+alpha_p)+beta
+      #f_noise <- rnorm(length(f),0,0)
+      #f_noise <- rnorm(length(f),0,sqrt(mean(f)))
+      #f_noise <- rnorm(length(f),0,100)
+      f_noise <- c(rnorm(1,0,exp_err_f*f[1]))
+      for(i in c(2:length(f))){
+        f_noise <- c(f_noise,rnorm(1,0,exp_err_f*f[i]))
+        #f_noise <- c(f_noise,rnorm(1,0,0.001*f[i]))
+        }
+      f_noisy <- f+f_noise
+      new_df <- tibble(time_min=time_min,corrected_od=od_noisy,fluo=f_noisy,replicate=r,alpha_p=alpha_p,alpha_0=alpha_0,beta=beta)
+      return(new_df)}
+  
+  .final_df <- lapply(c(1:rep), generate_single_trace)
+  .final_df <- do.call(rbind,.final_df)
+  return(.final_df)
+}
+
+mydata_silico <- tibble(promoter=c(1:100)) %>% 
+  group_by(promoter) %>% 
+  #partition(cluster=mycluster) %>%
+  do((function(.df){
+    .promoter <- unique(.df$promoter)
+    if(.promoter==1){
+      .control <- TRUE
+    }else{
+      .control <- FALSE}
+    new_df <- generate_traces(.control,replicates) %>% 
+      mutate(promoter=.promoter,
+             control=.control)
+    return(new_df)})(.)) %>% 
+  #collect() %>% 
+  ungroup()
+
+mydata_inference <- mydata_silico %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_xy_p=mean(corrected_od*fluo)) %>% 
+  mutate(mean_x2_p=mean((corrected_od)**2)) %>% 
+  mutate(mean_y2_p=mean((fluo)**2)) %>% 
+  mutate(mean_x_p=mean(corrected_od)) %>%
+  mutate(mean_y_p=mean(fluo)) %>%
+  mutate(var_x_p=var(corrected_od)) %>% 
+  mutate(Bp=(mean_y_p*mean_x2_p-mean_xy_p*mean_x_p)/(var_x_p)) %>% 
+  mutate(Qp2=(mean_y2_p*mean_x2_p-mean_xy_p**2)/(var_x_p)-Bp**2) %>% 
+  mutate(Np=n()) %>% 
+  ungroup() %>% 
+  mutate(aip=fluo-corrected_od*mean_xy_p/mean_x2_p) %>% 
+  mutate(bip=1-corrected_od*mean_x_p/mean_x2_p) %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_apbp=mean(aip*bip),
+         mean_ap2=mean(aip**2),
+         mean_bp2=mean(bip**2)) %>% 
+  mutate(Np=n()) %>% 
+  ungroup() %>% 
+  distinct(promoter,replicate,.keep_all=TRUE)
+
+compute_dL_dB <- function(.beta){
+  compute_dL_dB_p <- function(map2,mbp2,mapbp,np,.beta){
+    val_p <- np*(mapbp-mbp2*.beta)/(map2+mbp2*.beta**2-2*.beta*mapbp)}
+    
+  new_df <- mydata_inference %>% 
+    mutate(dL_dB_p=compute_dL_dB_p(mean_ap2,mean_bp2,mean_apbp,Np,.beta))
+    dL_dB <- sum(new_df$dL_dB_p)
+  return(dL_dB)
+}
+
+dichotomic_search <- function(.beta_max_ini){
+  beta <- 0
+  dL_dB <- compute_dL_dB(beta)
+  if(dL_dB<=0){
+    print(sprintf("beta,dL_dB = %s,%s",as.character(beta),as.character(dL_dB)))
+    return(0)
+  }else if(dL_dB>=0){
+    beta_min <- 0
+    beta_max <- .beta_max_ini}
+  
+  dL_dB <- compute_dL_dB(beta_max)
+  
+  while(dL_dB>0){
+  beta_max <- beta_max*2
+  dL_dB <- compute_dL_dB(beta_max)
+  }
+  print("Negative dL_dB, beginning dichotomic search")
+  print(sprintf("With beta_max,dL_dB = %s,%s",as.character(beta_max),as.character(dL_dB)))
+  
+  while((2*abs(beta_min-beta_max)/(beta_max+beta_min))>1e-3){
+    print(sprintf("beta_max,beta_min = %s,%s",as.character(beta_max),as.character(beta_min)))
+    beta <- (beta_max+beta_min)/2
+    dL_dB <- compute_dL_dB(beta)
+    print(sprintf("beta,dL_dB = %s,%s",as.character(beta),as.character(dL_dB)))
+    if(dL_dB>=0){
+      beta_min <- beta
+    }else{
+      beta_max <- beta}}
+  
+  return(beta)
+}
+
+
+compute_wp <- function(.Bp,.Qp2,np,.beta){
+  wp_val <- (np-1)/((.beta-.Bp)**2 + .Qp2)
+  return(wp_val)}
+
+compute_beta <- function(.df){
+  .new_df <- .df %>% 
+    mutate(num=wp*Bp)
+  val <- (sum(.new_df$num))/(sum(.new_df$wp))
+  return(val)}
+
+compute_error_beta <- function(.beta){
+  .new_df <- mydata_inference %>% 
+    mutate(dL2_dB2=(Np-1)*(Qp2-(.beta-Bp)**2)/(Qp2+(.beta-Bp)**2)**2)
+  val <- 1/sum(.new_df$dL2_dB2)
+  return(val)}
+
+iterative_search <- function(.beta_ini){
+  
+  .old_beta <- .beta_ini
+  
+  .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+  
+  .new_beta <- compute_beta(.df)
+  
+  while(abs(.new_beta-.old_beta)>0.01){
+    print(sprintf("old_beta,new_beta=%s,%s",as.character(.old_beta),as.character(.new_beta)))
+    .old_beta <- .new_beta
+    .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+    .new_beta <- compute_beta(.df)}
+    
+    return(.new_beta)
+
+  }
+
+approx_beta <- mydata_silico %>%
+  group_by(promoter,replicate) %>%
+  mutate(intercept=linear_mod_intercept(fluo,corrected_od)) %>% 
+  ungroup() %>% 
+  distinct(promoter,replicate,.keep_all=TRUE) %>% 
+  .$intercept %>% 
+  mean
+
+opt_beta_iterative <- iterative_search(approx_beta)
+opt_beta_dichotomic <- dichotomic_search(approx_beta)
+err_beta_iterative <- compute_error_beta(opt_beta_iterative)
+err_beta_dichotomic <- compute_error_beta(opt_beta_dichotomic)
+
+#Setting some error bars on beta
+
+mydata_inference <- mydata_inference %>% 
+  mutate(beta_predict_dic=opt_beta_dichotomic) %>% 
+  mutate(beta_predict_ite=opt_beta_iterative) %>% 
+  mutate(beta_var_dic=err_beta_dichotomic) %>%
+  mutate(beta_var_ite=err_beta_iterative) %>% 
+  mutate(beta_sd_ite=sqrt(beta_var_ite)) %>% 
+  mutate(beta_sd_dic=sqrt(beta_var_dic)) %>%
+  mutate(alpha_p_predict=(mean_xy_p-beta_predict_ite*mean_x_p)/(mean_x2_p)) %>% 
+  mutate(var_alpha_p=var_x_p/(mean_x2_p**2)*((beta_predict_ite-Bp)**2+Qp2)/Np) %>% 
+  mutate(sd_alpha_p=(sqrt(var_alpha_p)))
+
+mydata_inference %>% 
+  ggplot()+
+  geom_point(aes(alpha_p+alpha_0,alpha_p_predict))+
+  geom_errorbar(aes(x=alpha_p+alpha_0,ymin=alpha_p_predict-sd_alpha_p,ymax=alpha_p_predict+sd_alpha_p))+
+  geom_abline(aes(slope=1,intercept=0))+
+  theme_cowplot()
+
+mydata_inference %>% 
+  select(beta,beta_predict_ite,beta_sd_ite,beta_predict_dic,beta_sd_dic) %>% 
+  filter(row_number()==1)
+
+mydata_silico %>% 
+  ggplot()+
+  geom_point(aes(corrected_od,fluo))+
+  facet_wrap(~promoter,scales="free")
+```
+
+# Clean version
+
+## Packages and functions
+
+```{r}
+    library(tidyverse)
+    library(RcppArmadillo)
+    library(tools)
+    library(here)
+    library(cowplot)
+    library(devtools)
+    library(multidplyr)
+    library(vngMoM)
+    library(ggCustomTJ)
+    library(renv)
+    library(svglite)
+    Sys.setenv(RETICULATE_PYTHON = '/scicore/home/nimwegen/rocasu25/.local/share/r-miniconda/envs/r-reticulate/bin/python')
+    library(reticulate)
+    library(ggcorrplot)
+    library(lemon)
+    library(parallel)
+    library(broom)
+    library(stats)
+    library(ggpubr)
+
+generate_traces <- function(control,rep){
+  
+  if(control==TRUE){
+  alpha_p <- 0
+  }else{
+  alpha_p <- runif(1,min_alpha_p,max_alpha_p)}
+  
+  generate_single_trace <- function(r){
+      gr <- rnorm(1,mean_x,std_x)*log(2)/60
+      lod <- lod_ini + gr*time_min
+      residuals <- rnorm(length(lod),0,exp_err_od)
+      #residuals <- rnorm(length(lod),0,0)
+      od_noisy <- exp(lod)+residuals
+      lod_noisy <- log(od_noisy)
+      f <- exp(lod)*(alpha_0+alpha_p)+beta
+      #f_noise <- rnorm(length(f),0,0)
+      #f_noise <- rnorm(length(f),0,sqrt(mean(f)))
+      #f_noise <- rnorm(length(f),0,100)
+      f_noise <- c(rnorm(1,0,exp_err_f*f[1]))
+      for(i in c(2:length(f))){
+        f_noise <- c(f_noise,rnorm(1,0,exp_err_f*f[i]))
+        #f_noise <- c(f_noise,rnorm(1,0,0.001*f[i]))
+        }
+      f_noisy <- f+f_noise
+      new_df <- tibble(time_min=time_min,corrected_od=od_noisy,fluo=f_noisy,replicate=r,alpha_p=alpha_p,alpha_0=alpha_0,beta=beta)
+      return(new_df)}
+  
+  .final_df <- lapply(c(1:rep), generate_single_trace)
+  .final_df <- do.call(rbind,.final_df)
+  return(.final_df)
+}
+
+compute_dL_dB <- function(.beta){
+  compute_dL_dB_p <- function(map2,mbp2,mapbp,np,.beta){
+    val_p <- np*(mapbp-mbp2*.beta)/(map2+mbp2*.beta**2-2*.beta*mapbp)}
+    
+  new_df <- mydata_inference %>% 
+    mutate(dL_dB_p=compute_dL_dB_p(mean_ap2,mean_bp2,mean_apbp,Np,.beta))
+    dL_dB <- sum(new_df$dL_dB_p)
+  return(dL_dB)
+}
+
+dichotomic_search <- function(.beta_max_ini){
+  beta <- 0
+  dL_dB <- compute_dL_dB(beta)
+  if(dL_dB<=0){
+    print(sprintf("beta,dL_dB = %s,%s",as.character(beta),as.character(dL_dB)))
+    return(0)
+  }else if(dL_dB>=0){
+    beta_min <- 0
+    beta_max <- .beta_max_ini}
+  
+  dL_dB <- compute_dL_dB(beta_max)
+  
+  while(dL_dB>0){
+  beta_max <- beta_max*2
+  dL_dB <- compute_dL_dB(beta_max)
+  }
+  print("Negative dL_dB, beginning dichotomic search")
+  print(sprintf("With beta_max,dL_dB = %s,%s",as.character(beta_max),as.character(dL_dB)))
+  
+  while((2*abs(beta_min-beta_max)/(beta_max+beta_min))>1e-3){
+    print(sprintf("beta_max,beta_min = %s,%s",as.character(beta_max),as.character(beta_min)))
+    beta <- (beta_max+beta_min)/2
+    dL_dB <- compute_dL_dB(beta)
+    print(sprintf("beta,dL_dB = %s,%s",as.character(beta),as.character(dL_dB)))
+    if(dL_dB>=0){
+      beta_min <- beta
+    }else{
+      beta_max <- beta}}
+  
+  return(beta)
+}
+
+
+compute_wp <- function(.Bp,.Qp2,np,.beta){
+  wp_val <- (np-1)/((.beta-.Bp)**2 + .Qp2)
+  return(wp_val)}
+
+compute_beta <- function(.df){
+  .new_df <- .df %>% 
+    mutate(num=wp*Bp)
+  val <- (sum(.new_df$num))/(sum(.new_df$wp))
+  return(val)}
+
+compute_error_beta <- function(.beta){
+  .new_df <- mydata_inference %>% 
+    mutate(dL2_dB2=(Np-1)*(Qp2-(.beta-Bp)**2)/(Qp2+(.beta-Bp)**2)**2)
+  val <- 1/sum(.new_df$dL2_dB2)
+  return(val)}
+
+iterative_search <- function(.beta_ini){
+  
+  .old_beta <- .beta_ini
+  
+  .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+  
+  .new_beta <- compute_beta(.df)
+  
+  while(abs(.new_beta-.old_beta)>0.01){
+    print(sprintf("old_beta,new_beta=%s,%s",as.character(.old_beta),as.character(.new_beta)))
+    .old_beta <- .new_beta
+    .df <- mydata_inference %>% 
+    mutate(wp=compute_wp(Bp,Qp2,Np,.old_beta))
+    .new_beta <- compute_beta(.df)}
+    
+    return(.new_beta)
+
+  }
+    
+```
+
+## In silico data parameters
+
+```{r}
+# Set in silico data parameters
+
+N_promoter <- 99
+N_control <- 1
+replicates <- 3
+
+mean_alpha_0 <- 1000
+std_alpha_0 <- 0.01*mean_alpha_0
+mean_beta <- 200
+std_beta <- sqrt(mean_beta)
+#std_beta <- 0
+alpha_0 <- rnorm(1,mean_alpha_0,std_alpha_0)
+beta <- rnorm(1,mean_beta,std_beta)
+min_alpha_p <- 1000
+max_alpha_p <- 50000
+mean_x <- 1
+std_x <- 0.05
+lod_ini <- log(0.03)
+time_min <- seq(from = 0, to = 200, by = 15)
+#exp_err_od <- 0.001
+exp_err_od <- 0.01
+exp_err_f <- 0.01
+```
+
+## Generate data and running inference
+
+```{r}
+mydata_silico <- tibble(promoter=c(1:100)) %>% 
+  group_by(promoter) %>% 
+  do((function(.df){
+    .promoter <- unique(.df$promoter)
+    if(.promoter==1){
+      .control <- TRUE
+    }else{
+      .control <- FALSE}
+    new_df <- generate_traces(.control,replicates) %>% 
+      mutate(promoter=.promoter,
+             control=.control)
+    return(new_df)})(.)) %>% 
+  ungroup()
+
+mydata_inference <- mydata_silico %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_xy_p=mean(corrected_od*fluo)) %>% 
+  mutate(mean_x2_p=mean((corrected_od)**2)) %>% 
+  mutate(mean_y2_p=mean((fluo)**2)) %>% 
+  mutate(mean_x_p=mean(corrected_od)) %>%
+  mutate(mean_y_p=mean(fluo)) %>%
+  mutate(var_x_p=var(corrected_od)) %>% 
+  mutate(Bp=(mean_y_p*mean_x2_p-mean_xy_p*mean_x_p)/(var_x_p)) %>% 
+  mutate(Qp2=(mean_y2_p*mean_x2_p-mean_xy_p**2)/(var_x_p)-Bp**2) %>% 
+  mutate(Np=n()) %>% 
+  ungroup() %>% 
+  mutate(aip=fluo-corrected_od*mean_xy_p/mean_x2_p) %>% 
+  mutate(bip=1-corrected_od*mean_x_p/mean_x2_p) %>% 
+  group_by(promoter,replicate) %>% 
+  mutate(mean_apbp=mean(aip*bip),
+         mean_ap2=mean(aip**2),
+         mean_bp2=mean(bip**2)) %>% 
+  mutate(Np=n()) %>% 
+  ungroup() %>% 
+  distinct(promoter,replicate,.keep_all=TRUE)
+
+approx_beta <- mydata_silico %>%
+  group_by(promoter,replicate) %>%
+  mutate(intercept=linear_mod_intercept(fluo,corrected_od)) %>% 
+  ungroup() %>% 
+  distinct(promoter,replicate,.keep_all=TRUE) %>% 
+  .$intercept %>% 
+  mean
+
+opt_beta_iterative <- iterative_search(approx_beta)
+opt_beta_dichotomic <- dichotomic_search(approx_beta)
+err_beta_iterative <- compute_error_beta(opt_beta_iterative)
+err_beta_dichotomic <- compute_error_beta(opt_beta_dichotomic)
+
+#Setting some error bars on beta
+
+mydata_inference <- mydata_inference %>% 
+  mutate(beta_predict_dic=opt_beta_dichotomic) %>% 
+  mutate(beta_predict_ite=opt_beta_iterative) %>% 
+  mutate(beta_var_dic=err_beta_dichotomic) %>%
+  mutate(beta_var_ite=err_beta_iterative) %>% 
+  mutate(beta_sd_ite=sqrt(beta_var_ite)) %>% 
+  mutate(beta_sd_dic=sqrt(beta_var_dic)) %>%
+  mutate(alpha_tot_predict=(mean_xy_p-beta_predict_ite*mean_x_p)/(mean_x2_p)) %>% 
+  mutate(var_alpha_tot=var_x_p/(mean_x2_p**2)*((beta_predict_ite-Bp)**2+Qp2)/Np) %>% 
+  mutate(sd_alpha_tot=(sqrt(var_alpha_tot)))
+
+mydata_inference %>% 
+  ggplot()+
+  geom_point(aes(alpha_p+alpha_0,alpha_tot_predict))+
+  geom_errorbar(aes(x=alpha_p+alpha_0,ymin=alpha_tot_predict-sd_alpha_tot,ymax=alpha_tot_predict+sd_alpha_tot))+
+  geom_abline(aes(slope=1,intercept=0))+
+  theme_cowplot()
+
+mydata_inference %>% 
+  select(beta,beta_predict_ite,beta_sd_ite,beta_predict_dic,beta_sd_dic) %>% 
+  filter(row_number()==1)
+
+mydata_silico %>% 
+  ggplot()+
+  geom_point(aes(corrected_od,fluo))+
+  facet_wrap(~promoter,scales="free")
+```
+
+# Application to experimental data (test run 2)
+
+
+
+
+
+
